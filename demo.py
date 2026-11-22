@@ -4,16 +4,17 @@ from contextlib import ExitStack, closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from drift_workday import freeze_workday, load_workday
 from evidence.handoff import export_piece, load_piece
-from evidence.issue import issue
+from evidence.issue import issue, issue_drift
 from observations.intake import revise
 from observations.revisions import RevisionStore
 from publication.export import export_report
 from publication.history import read
-from publication.sign import sign
+from publication.sign import sign, sign_drift
 from publication.store import PublicationStore
 from registry.runs import RunCatalog
-from review.intake import IntakeStore, receive
+from review.intake import IntakeStore, receive, receive_drift
 from review.joint import assess
 
 
@@ -56,6 +57,77 @@ def _sign(root, sample, a_path, b_path, claim):
         reports.initialize()
         a, b = (receive(inbox, load_piece(path)) for path in (a_path, b_path))
         return sign(reports, inbox, assess(inbox, a.key, b.key, sample['contrast'], claim))
+
+
+def _drift_demo(root):
+    sample = load_workday('crossed')
+    centre_path = root / 'drift-centre.db'
+    with closing(sqlite3.connect(centre_path)) as centre:
+        intake = IntakeStore(centre)
+        reports = PublicationStore(centre)
+        intake.initialize()
+        reports.initialize()
+        with ExitStack() as sources:
+            catalog, stations, frozen = freeze_workday(
+                sources, sample, lambda filename: sqlite3.connect(root / filename))
+            received = {}
+            for label, revision in frozen.items():
+                entry = sample['versions'][label]
+                received[label] = receive_drift(intake, issue_drift(
+                    catalog, stations[revision.station], revision.revision_id,
+                    sample['work_box'], entry['certified_bounds']))
+        # The three source connections are closed; signing works offline.
+        signed = {}
+        for right in ('b', 'b_corrected'):
+            for window in ('full', 'early', 'point'):
+                signed[right, window] = sign_drift(
+                    reports, intake, received['a'].key, received[right].key,
+                    sample['windows'][window], sample['contrast'])
+    with closing(sqlite3.connect(centre_path)) as reopened:
+        archive = PublicationStore(reopened)
+        archive.initialize()
+        restored = {key: read(archive, report.number) for key, report in signed.items()}
+        destination = export_report(archive, signed['b', 'full'].number,
+                                    root / 'drift-report.json')
+        exported = json.loads(destination.read_text(encoding='utf-8'))
+    expected_cases = {
+        ('b', 'full'): [{'excluded_batch': None, 'range': ['1', '1']}],
+        ('b', 'early'): [],
+        ('b', 'point'): [{'excluded_batch': None, 'range': ['1', '1']}],
+        ('b_corrected', 'full'): [{'excluded_batch': None, 'range': ['0', '2']}],
+        ('b_corrected', 'early'): [{'excluded_batch': None, 'range': ['3/2', '2']}],
+        ('b_corrected', 'point'): [{'excluded_batch': None, 'range': ['1', '1']}],
+    }
+    actual_cases = {key: report.body['cases'] for key, report in signed.items()}
+    if actual_cases != expected_cases or restored != signed:
+        raise RuntimeError('the drift reports do not match the expected window table')
+    if (exported['body'] != signed['b', 'full'].body
+            or exported['parents'] != list(signed['b', 'full'].parents)
+            or exported['receipt'] != signed['b', 'full'].receipt.document()):
+        raise RuntimeError('the exported drift report does not match the signed original')
+    print(json.dumps({
+        'drift_run': sample['run_id'],
+        'reports': {f'a+{right}@{window}': {'number': signed[right, window].number,
+                                            'cases': cases}
+                    for (right, window), cases in actual_cases.items()},
+        'reopened_reads_match': True,
+    }, ensure_ascii=False, indent=2))
+    print('POINTWISE_SCENARIO ' + json.dumps({
+        'case_id': 'drift.narrow_window',
+        'input': {'parents': ['a+b', 'a+b_corrected'], 'windows': sample['windows'],
+                  'contrast': sample['contrast']},
+        'expected': {f'a+{right}@{window}': cases
+                     for (right, window), cases in expected_cases.items()},
+        'actual': {f'a+{right}@{window}': cases
+                   for (right, window), cases in actual_cases.items()},
+        'downstream_expected': 'signed reports are read back unchanged after the centre reopens',
+        'downstream_actual': 'signed reports are read back unchanged after the centre reopens',
+        'code_paths': ['evidence/issue.py', 'evidence/drift.py', 'evidence/polyhedra.py',
+                       'review/intake.py', 'publication/sign.py', 'publication/history.py',
+                       'publication/export.py'],
+        'oracle': 'a and b meet only at (x,z)=(1,1); the early window [0,1/2] excludes it, '
+                  'so the narrow report is empty while the full report fixes x at 1.'
+    }, ensure_ascii=False, sort_keys=True))
 
 
 def main():
@@ -102,6 +174,7 @@ def main():
                            'publication/history.py', 'publication/export.py'],
             'oracle': 'A gives x=5-4=1. The two B worksheets give y=2 and y=5 after conversion from mm.'
         }, ensure_ascii=False, sort_keys=True))
+        _drift_demo(root)
 
 
 if __name__ == '__main__':
